@@ -1,0 +1,769 @@
+#!/usr/bin/env python3
+"""
+Phoenix Pro Elite - Phase 2A: Database & Analytics
+Adds SQLite database, trade analytics, and alert system to existing UI
+Run this AFTER Phase 1 is working
+"""
+
+import os
+import sys
+import sqlite3
+import json
+import numpy as np
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# Configuration
+PHOENIX_DIR = Path("/root/phoenix-pro-elite")
+UI_FILE = PHOENIX_DIR / "ui" / "app.py"
+
+def install_additional_dependencies():
+    """Install additional packages for database functionality"""
+    import subprocess
+    
+    packages = [
+        "sqlite3",  # Usually built-in but ensure it's available
+    ]
+    
+    print("📦 Installing database dependencies...")
+    for package in packages:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", package])
+        except:
+            pass  # sqlite3 is usually built-in
+    print("✅ Database dependencies ready!")
+
+def backup_original_ui():
+    """Backup the original UI file"""
+    if UI_FILE.exists():
+        backup_file = UI_FILE.parent / f"app_backup_phase1_{datetime.now().strftime('%Y%m%d_%H%M%S')}.py"
+        import shutil
+        shutil.copy2(UI_FILE, backup_file)
+        print(f"✅ Backed up original UI to: {backup_file}")
+        return True
+    else:
+        print("❌ Original UI file not found. Please run Phase 1 first.")
+        return False
+
+def read_original_ui():
+    """Read the original UI content"""
+    with open(UI_FILE, 'r') as f:
+        return f.read()
+
+def create_database_additions():
+    """Create the database addition code"""
+    return '''
+# ============================================================================
+# PHASE 2A ADDITIONS: DATABASE & ANALYTICS
+# ============================================================================
+
+import sqlite3
+import hashlib
+import hmac
+import base64
+from cryptography.fernet import Fernet
+
+# Enhanced UI State with Database
+class EnhancedUIState:
+    def __init__(self):
+        self.backend_connected = False
+        self.strategies = {}
+        self.bots = {}
+        self.alerts = []
+        self.trade_analytics = {
+            'total_trades': 0,
+            'winning_trades': 0,
+            'losing_trades': 0,
+            'win_rate': 0,
+            'sharpe_ratio': 0,
+            'max_drawdown': 0,
+            'total_pnl': 0
+        }
+        self.live_data = {
+            'total_balance': 10000,
+            'pnl_24h': 125.50,
+            'pnl_7d': 687.30,
+            'pnl_mtd': 1245.80,
+            'win_rate': 0.75,
+            'equity_curve': [],
+            'daily_pnl': {},
+            'system_metrics': {}
+        }
+        self.websocket_health = {
+            'live_data': False,
+            'bot_status': False,
+            'trades': False,
+            'last_heartbeat': None,
+            'reconnect_attempts': 0
+        }
+        self.system_status = {
+            'uptime': 0,
+            'cpu_usage': 0,
+            'memory_usage': 0,
+            'disk_usage': 0,
+            'network_status': 'Unknown'
+        }
+        self.load_strategies()
+        self.init_database()
+        self.load_sample_data()
+    
+    def init_database(self):
+        """Initialize SQLite database connection"""
+        try:
+            self.db_path = PHOENIX_DIR / 'data' / 'trades.db'
+            self.db_connection = sqlite3.connect(str(self.db_path), check_same_thread=False)
+            self.create_database_tables()
+            logger.info("Database initialized successfully")
+        except Exception as e:
+            logger.error(f"Database initialization error: {e}")
+    
+    def create_database_tables(self):
+        """Create database tables if they don't exist"""
+        cursor = self.db_connection.cursor()
+        
+        # Trades table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                amount REAL NOT NULL,
+                price REAL NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                pnl REAL DEFAULT 0,
+                status TEXT DEFAULT 'open',
+                strategy TEXT,
+                fees REAL DEFAULT 0
+            )
+        """)
+        
+        # Alerts table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                level TEXT NOT NULL,
+                message TEXT NOT NULL,
+                bot_id TEXT,
+                acknowledged BOOLEAN DEFAULT FALSE,
+                category TEXT DEFAULT 'general'
+            )
+        """)
+        
+        # Bot health table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS bot_health (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bot_id TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                status TEXT NOT NULL,
+                error_count INTEGER DEFAULT 0,
+                last_trade DATETIME,
+                performance_score REAL DEFAULT 0,
+                uptime REAL DEFAULT 0,
+                profit_loss REAL DEFAULT 0
+            )
+        """)
+        
+        # System metrics table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS system_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                cpu_usage REAL,
+                memory_usage REAL,
+                disk_usage REAL,
+                network_latency REAL,
+                active_connections INTEGER
+            )
+        """)
+        
+        # API usage tracking
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS api_usage (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                service TEXT NOT NULL,
+                endpoint TEXT,
+                response_time REAL,
+                status_code INTEGER,
+                error_message TEXT
+            )
+        """)
+        
+        self.db_connection.commit()
+        logger.info("Database tables created successfully")
+    
+    def add_alert(self, level: str, message: str, bot_id: str = None, category: str = 'general'):
+        """Add alert to database and UI"""
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("""
+                INSERT INTO alerts (level, message, bot_id, category)
+                VALUES (?, ?, ?, ?)
+            """, (level, message, bot_id, category))
+            self.db_connection.commit()
+            
+            # Add to UI alerts list
+            alert = {
+                'id': cursor.lastrowid,
+                'timestamp': datetime.now().isoformat(),
+                'level': level,
+                'message': message,
+                'bot_id': bot_id,
+                'acknowledged': False,
+                'category': category
+            }
+            self.alerts.insert(0, alert)
+            
+            # Keep only last 100 alerts in memory
+            self.alerts = self.alerts[:100]
+            
+            logger.info(f"Alert added: {level} - {message}")
+            
+        except Exception as e:
+            logger.error(f"Error adding alert: {e}")
+    
+    def get_trade_analytics(self):
+        """Calculate trade analytics from database"""
+        try:
+            cursor = self.db_connection.cursor()
+            
+            # Total trades
+            cursor.execute("SELECT COUNT(*) FROM trades")
+            total_trades = cursor.fetchone()[0]
+            
+            # Winning/losing trades
+            cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl > 0")
+            winning_trades = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM trades WHERE pnl < 0")
+            losing_trades = cursor.fetchone()[0]
+            
+            # Win rate
+            win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
+            
+            # Total P&L
+            cursor.execute("SELECT SUM(pnl) FROM trades")
+            total_pnl = cursor.fetchone()[0] or 0
+            
+            # Calculate Sharpe ratio (simplified)
+            cursor.execute("SELECT pnl FROM trades ORDER BY timestamp DESC LIMIT 100")
+            recent_pnls = [row[0] for row in cursor.fetchall()]
+            
+            if len(recent_pnls) > 1:
+                returns = np.array(recent_pnls)
+                sharpe_ratio = np.mean(returns) / np.std(returns) if np.std(returns) > 0 else 0
+            else:
+                sharpe_ratio = 0
+            
+            # Calculate max drawdown
+            cursor.execute("SELECT pnl, timestamp FROM trades ORDER BY timestamp")
+            trades = cursor.fetchall()
+            
+            if trades:
+                cumulative_pnl = 0
+                peak = 0
+                max_drawdown = 0
+                
+                for pnl, _ in trades:
+                    cumulative_pnl += pnl
+                    if cumulative_pnl > peak:
+                        peak = cumulative_pnl
+                    
+                    drawdown = (peak - cumulative_pnl) / peak if peak > 0 else 0
+                    if drawdown > max_drawdown:
+                        max_drawdown = drawdown
+                
+                max_drawdown = max_drawdown * 100  # Convert to percentage
+            else:
+                max_drawdown = 0
+            
+            self.trade_analytics = {
+                'total_trades': total_trades,
+                'winning_trades': winning_trades,
+                'losing_trades': losing_trades,
+                'win_rate': win_rate,
+                'sharpe_ratio': sharpe_ratio,
+                'max_drawdown': max_drawdown,
+                'total_pnl': total_pnl
+            }
+            
+        except Exception as e:
+            logger.error(f"Error calculating trade analytics: {e}")
+    
+    def add_sample_trades(self):
+        """Add sample trades for demo"""
+        sample_trades = [
+            ('bot_conservative_001', 'binance', 'BTC/USDT', 'buy', 0.1, 45000, 125.50, 'conservative'),
+            ('bot_aggressive_002', 'binance', 'ETH/USDT', 'buy', 2.0, 3000, 298.75, 'aggressive'),
+            ('bot_conservative_001', 'binance', 'BTC/USDT', 'sell', 0.1, 45500, 50.0, 'conservative'),
+            ('bot_aggressive_002', 'binance', 'ETH/USDT', 'sell', 1.0, 3100, -25.30, 'aggressive'),
+        ]
+        
+        cursor = self.db_connection.cursor()
+        for trade in sample_trades:
+            cursor.execute("""
+                INSERT INTO trades (bot_id, exchange, symbol, side, amount, price, pnl, strategy)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, trade)
+        
+        self.db_connection.commit()
+        logger.info("Sample trades added")
+    
+    def load_strategies(self):
+        """Load strategy definitions"""
+        strategies_file = PHOENIX_DIR / 'data' / 'strategies.json'
+        
+        # Your exact 6 strategies
+        default_strategies = {
+            "conservative": {
+                "name": "Conservative",
+                "description": "Low risk, steady gains",
+                "risk": 0.01,
+                "leverage": 1,
+                "icon": "🛡️",
+                "max_positions": 3,
+                "stop_loss": 0.02,
+                "take_profit": 0.03
+            },
+            "standard": {
+                "name": "Standard", 
+                "description": "Balanced approach",
+                "risk": 0.02,
+                "leverage": 2,
+                "icon": "⚖️",
+                "max_positions": 5,
+                "stop_loss": 0.03,
+                "take_profit": 0.05
+            },
+            "aggressive": {
+                "name": "Aggressive",
+                "description": "Higher risk/reward",
+                "risk": 0.05,
+                "leverage": 5,
+                "icon": "🚀",
+                "max_positions": 8,
+                "stop_loss": 0.05,
+                "take_profit": 0.10
+            },
+            "flipv2": {
+                "name": "Flip V2",
+                "description": "Rapid reversal strategy",
+                "risk": 0.03,
+                "leverage": 3,
+                "icon": "🔥",
+                "max_positions": 6,
+                "stop_loss": 0.04,
+                "take_profit": 0.06
+            },
+            "btc_inverse_perp": {
+                "name": "BTC Inverse Perp",
+                "description": "Bitcoin inverse perpetual",
+                "risk": 0.04,
+                "leverage": 10,
+                "icon": "₿",
+                "max_positions": 4,
+                "stop_loss": 0.06,
+                "take_profit": 0.12
+            },
+            "aggressive_ii": {
+                "name": "Aggressive II",
+                "description": "Maximum risk mode", 
+                "risk": 0.10,
+                "leverage": 20,
+                "icon": "⚡",
+                "max_positions": 10,
+                "stop_loss": 0.08,
+                "take_profit": 0.20
+            }
+        }
+        
+        if not strategies_file.exists():
+            with open(strategies_file, 'w') as f:
+                json.dump(default_strategies, f, indent=2)
+        
+        try:
+            with open(strategies_file, 'r') as f:
+                self.strategies = json.load(f)
+        except Exception as e:
+            logger.error(f"Error loading strategies: {e}")
+            self.strategies = default_strategies
+    
+    def load_sample_data(self):
+        """Load sample data for demo"""
+        # Sample bot data
+        self.bots = {
+            "bot_conservative_001": {
+                "name": "Conservative BTC",
+                "exchange": "binance",
+                "pair": "BTC/USDT",
+                "strategy": "conservative",
+                "equity": 5000,
+                "active": True,
+                "pnl_24h": 125.50,
+                "pnl_7d": 687.30,
+                "error_count": 0,
+                "last_update": "2024-12-07T12:00:00Z",
+                "performance_score": 0.85,
+                "trades_today": 8,
+                "win_rate": 0.75,
+                "max_drawdown": 0.02,
+                "uptime": 99.8
+            },
+            "bot_aggressive_002": {
+                "name": "Aggressive ETH",
+                "exchange": "binance",
+                "pair": "ETH/USDT",
+                "strategy": "aggressive",
+                "equity": 3000,
+                "active": True,
+                "pnl_24h": 298.75,
+                "pnl_7d": 1245.80,
+                "error_count": 1,
+                "last_update": "2024-12-07T12:00:00Z",
+                "performance_score": 0.92,
+                "trades_today": 15,
+                "win_rate": 0.87,
+                "max_drawdown": 0.08,
+                "uptime": 98.5
+            },
+            "bot_flipv2_003": {
+                "name": "Flip V2 SOL",
+                "exchange": "bybit",
+                "pair": "SOL/USDT",
+                "strategy": "flipv2",
+                "equity": 2500,
+                "active": True,
+                "pnl_24h": 167.30,
+                "pnl_7d": 892.40,
+                "error_count": 0,
+                "last_update": "2024-12-07T12:00:00Z",
+                "performance_score": 0.88,
+                "trades_today": 22,
+                "win_rate": 0.82,
+                "max_drawdown": 0.06,
+                "uptime": 99.2
+            }
+        }
+        
+        # Add sample trades if database is empty
+        try:
+            cursor = self.db_connection.cursor()
+            cursor.execute("SELECT COUNT(*) FROM trades")
+            trade_count = cursor.fetchone()[0]
+            
+            if trade_count == 0:
+                self.add_sample_trades()
+                logger.info("Added sample trades to database")
+        except:
+            pass
+
+# Database Routes
+@app.route('/api/ui/alerts')
+def get_alerts():
+    """Get system alerts"""
+    try:
+        # Get alerts from database
+        cursor = ui_state.db_connection.cursor()
+        cursor.execute("""
+            SELECT id, timestamp, level, message, bot_id, acknowledged, category
+            FROM alerts 
+            ORDER BY timestamp DESC 
+            LIMIT 100
+        """)
+        
+        alerts = []
+        for row in cursor.fetchall():
+            alerts.append({
+                'id': row[0],
+                'timestamp': row[1],
+                'level': row[2],
+                'message': row[3],
+                'bot_id': row[4],
+                'acknowledged': bool(row[5]),
+                'category': row[6]
+            })
+        
+        unacknowledged_count = len([a for a in alerts if not a['acknowledged']])
+        
+        return jsonify({
+            'alerts': alerts,
+            'unacknowledged_count': unacknowledged_count,
+            'total_count': len(alerts)
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/ui/alerts/<int:alert_id>/acknowledge', methods=['POST'])
+def acknowledge_alert(alert_id):
+    """Acknowledge an alert"""
+    try:
+        cursor = ui_state.db_connection.cursor()
+        cursor.execute("UPDATE alerts SET acknowledged = TRUE WHERE id = ?", (alert_id,))
+        ui_state.db_connection.commit()
+        
+        # Update in memory
+        for alert in ui_state.alerts:
+            if alert['id'] == alert_id:
+                alert['acknowledged'] = True
+                break
+        
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/ui/analytics')
+def get_analytics():
+    """Get trading analytics"""
+    try:
+        ui_state.get_trade_analytics()
+        return jsonify(ui_state.trade_analytics)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+@app.route('/api/ui/trades')
+def get_trades():
+    """Get recent trades"""
+    try:
+        cursor = ui_state.db_connection.cursor()
+        cursor.execute("""
+            SELECT id, bot_id, exchange, symbol, side, amount, price, timestamp, pnl, status, strategy
+            FROM trades 
+            ORDER BY timestamp DESC 
+            LIMIT 50
+        """)
+        
+        trades = []
+        for row in cursor.fetchall():
+            trades.append({
+                'id': row[0],
+                'bot_id': row[1],
+                'exchange': row[2],
+                'symbol': row[3],
+                'side': row[4],
+                'amount': row[5],
+                'price': row[6],
+                'timestamp': row[7],
+                'pnl': row[8],
+                'status': row[9],
+                'strategy': row[10]
+            })
+        
+        return jsonify(trades)
+    except Exception as e:
+        return jsonify({'error': str(e)})
+
+'''
+
+def modify_ui_file():
+    """Modify the existing UI file to add database functionality"""
+    original_content = read_original_ui()
+    
+    # Find the UIState class and replace it
+    ui_state_start = original_content.find("class UIState:")
+    if ui_state_start == -1:
+        print("❌ Could not find UIState class in original file")
+        return False
+    
+    # Find the end of the UIState class (next class or main function)
+    lines = original_content.split('\n')
+    ui_state_line = None
+    for i, line in enumerate(lines):
+        if "class UIState:" in line:
+            ui_state_line = i
+            break
+    
+    if ui_state_line is None:
+        print("❌ Could not locate UIState class")
+        return False
+    
+    # Find where to insert the enhanced code
+    insert_point = None
+    for i in range(ui_state_line + 1, len(lines)):
+        if lines[i].startswith("# Initialize UI state") or lines[i].startswith("ui_state = UIState()"):
+            insert_point = i
+            break
+    
+    if insert_point is None:
+        # Find the backend communication section
+        for i, line in enumerate(lines):
+            if "# Backend communication" in line or "def call_backend_api" in line:
+                insert_point = i
+                break
+    
+    if insert_point is None:
+        print("❌ Could not find insertion point")
+        return False
+    
+    # Replace UIState initialization
+    ui_state_init_line = None
+    for i, line in enumerate(lines):
+        if "ui_state = UIState()" in line:
+            ui_state_init_line = i
+            break
+    
+    # Create the new content
+    new_lines = lines[:ui_state_line]  # Everything before UIState class
+    
+    # Add the database additions
+    database_code = create_database_additions()
+    new_lines.extend(database_code.split('\n'))
+    
+    # Skip the original UIState class
+    skip_until = None
+    for i in range(ui_state_line + 1, len(lines)):
+        if lines[i].startswith("# Initialize UI state") or lines[i].startswith("ui_state = "):
+            skip_until = i
+            break
+        elif lines[i].startswith("def ") and not lines[i].strip().startswith("def __"):
+            skip_until = i
+            break
+        elif lines[i].startswith("class "):
+            skip_until = i
+            break
+    
+    if skip_until is None:
+        skip_until = len(lines)
+    
+    # Add the enhanced UI state initialization
+    new_lines.append("# Initialize enhanced UI state with database")
+    new_lines.append("ui_state = EnhancedUIState()")
+    new_lines.append("")
+    
+    # Add the rest of the original content
+    new_lines.extend(lines[skip_until:])
+    
+    # Write the modified content
+    with open(UI_FILE, 'w') as f:
+        f.write('\n'.join(new_lines))
+    
+    return True
+
+def create_sample_data_files():
+    """Create sample data files"""
+    # Create sample equity curve data
+    telemetry_dir = PHOENIX_DIR / "logs" / "telemetry"
+    telemetry_dir.mkdir(exist_ok=True)
+    
+    equity_data = []
+    base_equity = 10000
+    current_time = datetime.now() - timedelta(hours=24)
+    
+    for i in range(288):  # 5-minute intervals for 24 hours
+        import random
+        change = random.uniform(-0.5, 0.8)  # Slight upward bias
+        pnl = base_equity * change / 100
+        base_equity += pnl
+        
+        equity_data.append({
+            'timestamp': current_time.isoformat() + 'Z',
+            'equity': round(base_equity, 2),
+            'change': round(change, 2),
+            'pnl': round(pnl, 2)
+        })
+        
+        current_time += timedelta(minutes=5)
+    
+    with open(telemetry_dir / "equity_curve.json", 'w') as f:
+        json.dump(equity_data, f, indent=2)
+    
+    # Create sample daily P&L data
+    performance_dir = PHOENIX_DIR / "logs" / "performance"
+    performance_dir.mkdir(exist_ok=True)
+    
+    current_date = datetime.now().strftime('%Y-%m')
+    daily_pnl = {}
+    
+    for day in range(1, 8):  # Last 7 days
+        date_key = f"{current_date}-{day:02d}"
+        daily_pnl[date_key] = {
+            "pnl": round(random.uniform(-100, 300), 2),
+            "trades": random.randint(5, 20),
+            "win_rate": round(random.uniform(0.6, 0.9), 2),
+            "best_trade": round(random.uniform(20, 100), 2),
+            "worst_trade": round(random.uniform(-50, -10), 2)
+        }
+    
+    with open(performance_dir / "daily_pnl.json", 'w') as f:
+        json.dump(daily_pnl, f, indent=2)
+    
+    print("✅ Sample data files created")
+
+def main():
+    print("""
+╔══════════════════════════════════════════════════════════════════╗
+║                  PHOENIX PRO ELITE - PHASE 2A                   ║
+║                  Database & Analytics Addition                   ║
+║                        📊 ENHANCING UI 📊                       ║
+╚══════════════════════════════════════════════════════════════════╝
+    """)
+    
+    print("🔍 Phase 2A: Adding database and analytics...")
+    
+    # Install dependencies
+    install_additional_dependencies()
+    
+    # Check if Phase 1 exists
+    if not UI_FILE.exists():
+        print("❌ Phase 1 UI file not found!")
+        print(f"   Please run Phase 1 first and ensure {UI_FILE} exists")
+        return False
+    
+    print("✅ Phase 1 UI file found")
+    
+    # Backup original
+    if not backup_original_ui():
+        return False
+    
+    # Modify the UI file
+    print("🔧 Adding database functionality...")
+    if not modify_ui_file():
+        print("❌ Failed to modify UI file")
+        return False
+    
+    # Create sample data
+    print("📊 Creating sample data files...")
+    create_sample_data_files()
+    
+    print()
+    print("✅ PHASE 2A INSTALLATION COMPLETE!")
+    print("==================================")
+    print()
+    print("📊 ADDED FEATURES:")
+    print("   🗄️ SQLite database with tables:")
+    print("     - trades (trading history)")
+    print("     - alerts (system alerts)")
+    print("     - bot_health (bot monitoring)")
+    print("     - system_metrics (performance)")
+    print("     - api_usage (API tracking)")
+    print()
+    print("   📈 Trade Analytics:")
+    print("     - Win rate calculation")
+    print("     - Sharpe ratio")
+    print("     - Maximum drawdown")
+    print("     - P&L tracking")
+    print()
+    print("   🔔 Alert System:")
+    print("     - Database-backed alerts")
+    print("     - Alert categorization")
+    print("     - Alert acknowledgment")
+    print()
+    print("   📊 New API Endpoints:")
+    print("     - /api/ui/alerts")
+    print("     - /api/ui/analytics")
+    print("     - /api/ui/trades")
+    print()
+    print("🚀 RESTART YOUR UI:")
+    print("   cd /root/phoenix-pro-elite/ui")
+    print("   python3 app.py")
+    print()
+    print("🎯 READY FOR PHASE 2B: API Integrations!")
+    
+    return True
+
+if __name__ == "__main__":
+    import random  # Add missing import
+    main()
