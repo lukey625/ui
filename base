@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""
+Phoenix Pro Elite - Phase 1: Core UI Foundation
+Complete trading dashboard with core functionality
+Ready for /root/phoenix-pro-elite/ui/app.py
+"""
+
+import os
+import sys
+import subprocess
+import json
+import time
+import signal
+import threading
+import logging
+import traceback
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Any, Optional
+
+# Auto-install ALL dependencies - ONE SHOT COMMAND
+def install_all_dependencies():
+    """Install all required packages for Phoenix UI"""
+    packages = [
+        # Core Flask and web dependencies
+        "flask==3.0.0",
+        "flask-cors==4.0.0", 
+        "flask-socketio==5.3.6",
+        "python-socketio==5.10.0",
+        "eventlet==0.33.3",
+        
+        # HTTP and async
+        "requests==2.31.0",
+        "aiohttp==3.9.1",
+        "websockets==12.0",
+        
+        # System monitoring
+        "psutil==5.9.6",
+        
+        # Data handling
+        "pandas==2.1.4",
+        "numpy==1.25.2",
+        
+        # Utilities
+        "python-dateutil==2.8.2",
+        "pytz==2023.3",
+        
+        # Basic encryption for Phase 1
+        "cryptography==41.0.7"
+    ]
+    
+    print("📦 Installing Phoenix UI dependencies...")
+    print(f"Installing {len(packages)} packages...")
+    
+    # Install in batches for reliability
+    batch_size = 5
+    for i in range(0, len(packages), batch_size):
+        batch = packages[i:i+batch_size]
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "--upgrade"
+            ] + batch, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            print(f"✅
