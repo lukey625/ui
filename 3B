@@ -1,0 +1,1384 @@
+#!/bin/bash
+
+# Phoenix Pro Elite - Phase 3B: Automation & Backup System
+# Complete automation system with backups, maintenance, and recovery
+# Run this AFTER Phase 3A is working
+
+echo "🔄 Phoenix Pro Elite - Phase 3B: Automation & Backup System"
+echo "==========================================================="
+
+PHOENIX_DIR="/root/phoenix-pro-elite"
+
+echo "📁 Phoenix Directory: $PHOENIX_DIR"
+
+# Check if running as root for system-level automation
+if [[ $EUID -eq 0 ]]; then
+   echo "✅ Running as root - will set up full automation"
+   SETUP_SYSTEM=true
+else
+   echo "ℹ️  Running as user - limited automation setup"
+   SETUP_SYSTEM=false
+fi
+
+# Check if previous phases are installed
+if [ ! -f "$PHOENIX_DIR/scripts/monitoring/system_monitor.sh" ]; then
+    echo "❌ Phase 3A monitoring not found!"
+    echo "   Please run Phase 3A first"
+    exit 1
+fi
+
+echo "✅ Previous phases detected"
+
+# Create automation directories
+echo "📁 Creating automation directory structure..."
+mkdir -p "$PHOENIX_DIR/scripts/automation"
+mkdir -p "$PHOENIX_DIR/backups"
+mkdir -p "$PHOENIX_DIR/logs/automation"
+mkdir -p "$PHOENIX_DIR/logs/backup"
+mkdir -p "$PHOENIX_DIR/logs/maintenance"
+
+echo "✅ Automation directories created"
+
+# Create automated backup system
+echo "💾 Creating automated backup system..."
+cat > "$PHOENIX_DIR/scripts/automation/automated_backup.sh" << 'EOF'
+#!/bin/bash
+
+# Phoenix Pro Elite - Automated Backup System
+# Complete system backup with rotation and verification
+
+PHOENIX_DIR="/root/phoenix-pro-elite"
+BACKUP_DIR="$PHOENIX_DIR/backups"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_NAME="phoenix_full_backup_$TIMESTAMP"
+BACKUP_LOG="$PHOENIX_DIR/logs/backup/backup.log"
+
+# Create backup directory
+mkdir -p "$BACKUP_DIR"
+mkdir -p "$PHOENIX_DIR/logs/backup"
+
+# Function to log with timestamp
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$BACKUP_LOG"
+}
+
+# Function to send alert
+send_alert() {
+    local level="$1"
+    local message="$2"
+    
+    log_message "ALERT [$level]: $message"
+    
+    if curl -s http://localhost:3000/api/ui/alerts > /dev/null 2>&1; then
+        curl -s -X POST http://localhost:3000/api/ui/alerts \
+             -H "Content-Type: application/json" \
+             -d "{\"level\":\"$level\",\"message\":\"$message\",\"category\":\"backup\"}" > /dev/null 2>&1
+    fi
+}
+
+log_message "Starting automated backup: $BACKUP_NAME"
+
+# Items to backup
+BACKUP_ITEMS=(
+    "config.json"
+    "data/strategies.json"
+    "data/bots.json"
+    "data/trades.db"
+    "data/api_keys.json"
+    "data/.encryption_key"
+    "data/.master_key"
+    "data/.salt"
+    "ui/app.py"
+    "scripts/"
+    "logs/telemetry/"
+    "logs/performance/"
+)
+
+# Pre-backup validation
+log_message "Validating backup items..."
+MISSING_ITEMS=0
+for item in "${BACKUP_ITEMS[@]}"; do
+    if [ ! -e "$PHOENIX_DIR/$item" ]; then
+        log_message "WARNING: $item not found"
+        ((MISSING_ITEMS++))
+    fi
+done
+
+if [ $MISSING_ITEMS -gt 0 ]; then
+    log_message "WARNING: $MISSING_ITEMS items missing from backup"
+fi
+
+# Create backup archive
+log_message "Creating backup archive..."
+cd "$PHOENIX_DIR"
+
+tar -czf "$BACKUP_DIR/$BACKUP_NAME.tar.gz" \
+    --exclude="logs/system/*.log" \
+    --exclude="logs/monitoring/*.log" \
+    --exclude="logs/backup/*.log" \
+    --exclude="backups/*.tar.gz" \
+    --exclude="__pycache__" \
+    --exclude="*.pyc" \
+    --exclude="*.tmp" \
+    --exclude="*.temp" \
+    "${BACKUP_ITEMS[@]}" 2>/dev/null
+
+if [ $? -eq 0 ]; then
+    BACKUP_SIZE=$(du -h "$BACKUP_DIR/$BACKUP_NAME.tar.gz" | cut -f1)
+    log_message "Backup created successfully: $BACKUP_NAME.tar.gz ($BACKUP_SIZE)"
+    
+    # Verify backup integrity
+    log_message "Verifying backup integrity..."
+    tar -tzf "$BACKUP_DIR/$BACKUP_NAME.tar.gz" >/dev/null 2>&1
+    if [ $? -eq 0 ]; then
+        log_message "Backup integrity verified"
+        
+        # Create backup manifest
+        tar -tzf "$BACKUP_DIR/$BACKUP_NAME.tar.gz" > "$BACKUP_DIR/$BACKUP_NAME.manifest"
+        log_message "Backup manifest created"
+        
+        # Create backup metadata
+        cat > "$BACKUP_DIR/$BACKUP_NAME.meta" << META_EOF
+{
+    "backup_name": "$BACKUP_NAME",
+    "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+    "size_bytes": $(stat -c%s "$BACKUP_DIR/$BACKUP_NAME.tar.gz"),
+    "size_human": "$BACKUP_SIZE",
+    "items_count": ${#BACKUP_ITEMS[@]},
+    "missing_items": $MISSING_ITEMS,
+    "phoenix_version": "Pro Elite v2.0",
+    "backup_type": "full",
+    "compression": "gzip"
+}
+META_EOF
+        
+        send_alert "success" "Backup completed successfully: $BACKUP_NAME.tar.gz ($BACKUP_SIZE)"
+        
+    else
+        log_message "ERROR: Backup integrity check failed"
+        send_alert "error" "Backup integrity check failed: $BACKUP_NAME.tar.gz"
+        exit 1
+    fi
+    
+else
+    log_message "ERROR: Backup creation failed"
+    send_alert "error" "Backup creation failed"
+    exit 1
+fi
+
+# Backup rotation - keep last N backups based on config
+RETENTION_DAYS=7
+if [ -f "$PHOENIX_DIR/config.json" ] && command -v python3 &> /dev/null; then
+    RETENTION_DAYS=$(python3 -c "
+import json
+try:
+    with open('$PHOENIX_DIR/config.json') as f:
+        config = json.load(f)
+    print(config.get('backup_retention_days', 7))
+except:
+    print(7)
+" 2>/dev/null)
+fi
+
+log_message "Applying backup retention policy ($RETENTION_DAYS days)..."
+
+# Remove old backups
+DELETED_COUNT=0
+for old_backup in $(find "$BACKUP_DIR" -name "phoenix_full_backup_*.tar.gz" -mtime +$RETENTION_DAYS); do
+    BACKUP_BASE=$(basename "$old_backup" .tar.gz)
+    rm -f "$old_backup"
+    rm -f "$BACKUP_DIR/$BACKUP_BASE.manifest"
+    rm -f "$BACKUP_DIR/$BACKUP_BASE.meta"
+    ((DELETED_COUNT++))
+    log_message "Deleted old backup: $(basename "$old_backup")"
+done
+
+if [ $DELETED_COUNT -gt 0 ]; then
+    log_message "Deleted $DELETED_COUNT old backups"
+fi
+
+# Count remaining backups
+TOTAL_BACKUPS=$(find "$BACKUP_DIR" -name "phoenix_full_backup_*.tar.gz" | wc -l)
+log_message "Total backups retained: $TOTAL_BACKUPS"
+
+# Calculate total backup storage used
+TOTAL_BACKUP_SIZE=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)
+log_message "Total backup storage: $TOTAL_BACKUP_SIZE"
+
+# Create quick backup report
+cat > "$BACKUP_DIR/latest_backup_report.txt" << REPORT_EOF
+Phoenix Pro Elite - Latest Backup Report
+========================================
+Date: $(date)
+Backup: $BACKUP_NAME.tar.gz
+Size: $BACKUP_SIZE
+Status: Success
+Items: ${#BACKUP_ITEMS[@]} categories
+Missing: $MISSING_ITEMS items
+Retention: $RETENTION_DAYS days
+Total Backups: $TOTAL_BACKUPS
+Storage Used: $TOTAL_BACKUP_SIZE
+
+Recent Backups:
+$(find "$BACKUP_DIR" -name "phoenix_full_backup_*.tar.gz" -printf "%T@ %p\n" | sort -nr | head -5 | while read timestamp file; do echo "  $(date -d @${timestamp%.*} '+%Y-%m-%d %H:%M') - $(basename "$file")"; done)
+REPORT_EOF
+
+log_message "Backup report created: latest_backup_report.txt"
+
+# Optional: Upload to remote storage (placeholder for future implementation)
+REMOTE_BACKUP_ENABLED=false
+if [ -f "$PHOENIX_DIR/config.json" ] && command -v python3 &> /dev/null; then
+    REMOTE_BACKUP_ENABLED=$(python3 -c "
+import json
+try:
+    with open('$PHOENIX_DIR/config.json') as f:
+        config = json.load(f)
+    print(config.get('remote_backup_enabled', 'false'))
+except:
+    print('false')
+" 2>/dev/null)
+fi
+
+if [ "$REMOTE_BACKUP_ENABLED" = "true" ]; then
+    log_message "Remote backup enabled but not configured"
+    # Add your remote backup commands here:
+    # rsync -av "$BACKUP_DIR/$BACKUP_NAME.tar.gz" user@remote:/backups/
+    # aws s3 cp "$BACKUP_DIR/$BACKUP_NAME.tar.gz" s3://your-bucket/phoenix-backups/
+    # rclone copy "$BACKUP_DIR/$BACKUP_NAME.tar.gz" remote:phoenix-backups/
+fi
+
+log_message "Automated backup completed successfully"
+
+# Backup summary
+log_message "Backup Summary:"
+log_message "  - Archive: $BACKUP_NAME.tar.gz"
+log_message "  - Size: $BACKUP_SIZE"
+log_message "  - Items: ${#BACKUP_ITEMS[@]} categories"
+log_message "  - Missing: $MISSING_ITEMS items"
+log_message "  - Retention: $RETENTION_DAYS days"
+log_message "  - Total backups: $TOTAL_BACKUPS"
+log_message "  - Storage used: $TOTAL_BACKUP_SIZE"
+EOF
+
+chmod +x "$PHOENIX_DIR/scripts/automation/automated_backup.sh"
+
+# Create database maintenance script
+echo "🗄️ Creating database maintenance script..."
+cat > "$PHOENIX_DIR/scripts/automation/database_maintenance.sh" << 'EOF'
+#!/bin/bash
+
+# Phoenix Pro Elite - Database Maintenance
+# Automated database optimization and cleanup
+
+PHOENIX_DIR="/root/phoenix-pro-elite"
+DB_PATH="$PHOENIX_DIR/data/trades.db"
+BACKUP_PATH="$PHOENIX_DIR/backups/db_backup_$(date +%Y%m%d_%H%M%S).db"
+MAINT_LOG="$PHOENIX_DIR/logs/maintenance/database_maintenance.log"
+
+# Create maintenance logs
+mkdir -p "$PHOENIX_DIR/logs/maintenance"
+mkdir -p "$PHOENIX_DIR/backups"
+
+# Function to log with timestamp
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$MAINT_LOG"
+}
+
+# Function to send alert
+send_alert() {
+    local level="$1"
+    local message="$2"
+    
+    log_message "ALERT [$level]: $message"
+    
+    if curl -s http://localhost:3000/api/ui/alerts > /dev/null 2>&1; then
+        curl -s -X POST http://localhost:3000/api/ui/alerts \
+             -H "Content-Type: application/json" \
+             -d "{\"level\":\"$level\",\"message\":\"$message\",\"category\":\"maintenance\"}" > /dev/null 2>&1
+    fi
+}
+
+log_message "Starting database maintenance"
+
+if [ ! -f "$DB_PATH" ]; then
+    log_message "Database not found: $DB_PATH"
+    send_alert "error" "Database file not found during maintenance"
+    exit 1
+fi
+
+# Create backup before maintenance
+log_message "Creating database backup..."
+cp "$DB_PATH" "$BACKUP_PATH"
+if [ $? -eq 0 ]; then
+    BACKUP_SIZE=$(du -h "$BACKUP_PATH" | cut -f1)
+    log_message "Database backup created: $(basename "$BACKUP_PATH") ($BACKUP_SIZE)"
+else
+    log_message "ERROR: Failed to create database backup"
+    send_alert "error" "Failed to create database backup"
+    exit 1
+fi
+
+# Database statistics before maintenance
+log_message "Database statistics before maintenance:"
+if command -v sqlite3 &> /dev/null; then
+    sqlite3 "$DB_PATH" << 'SQL' 2>/dev/null | while read line; do log_message "  $line"; done
+.headers off
+.mode line
+SELECT 'Trades: ' || COUNT(*) FROM trades;
+SELECT 'Alerts: ' || COUNT(*) FROM alerts;
+SELECT 'Bot Health Records: ' || COUNT(*) FROM bot_health;
+SELECT 'System Metrics: ' || COUNT(*) FROM system_metrics;
+SELECT 'API Usage Records: ' || COUNT(*) FROM api_usage;
+SQL
+fi
+
+# Get database size before
+DB_SIZE_BEFORE=$(du -h "$DB_PATH" | cut -f1)
+log_message "Database size before: $DB_SIZE_BEFORE"
+
+# Vacuum database (reclaim space)
+log_message "Vacuuming database..."
+sqlite3 "$DB_PATH" "VACUUM;" 2>/dev/null
+if [ $? -eq 0 ]; then
+    log_message "Database vacuumed successfully"
+else
+    log_message "WARNING: Vacuum operation failed"
+fi
+
+# Analyze database (update statistics)
+log_message "Analyzing database..."
+sqlite3 "$DB_PATH" "ANALYZE;" 2>/dev/null
+if [ $? -eq 0 ]; then
+    log_message "Database analyzed successfully"
+else
+    log_message "WARNING: Analyze operation failed"
+fi
+
+# Reindex database
+log_message "Reindexing database..."
+sqlite3 "$DB_PATH" "REINDEX;" 2>/dev/null
+if [ $? -eq 0 ]; then
+    log_message "Database reindexed successfully"
+else
+    log_message "WARNING: Reindex operation failed"
+fi
+
+# Clean old records based on retention policies
+log_message "Cleaning old records..."
+
+# Clean old alerts (older than 30 days, but keep critical ones for 90 days)
+DELETED_ALERTS=$(sqlite3 "$DB_PATH" "
+DELETE FROM alerts 
+WHERE timestamp < datetime('now', '-30 days') 
+AND level NOT IN ('critical', 'error')
+UNION ALL
+SELECT changes();
+DELETE FROM alerts 
+WHERE timestamp < datetime('now', '-90 days');
+SELECT changes();" 2>/dev/null | tail -1)
+
+if [ -n "$DELETED_ALERTS" ] && [ "$DELETED_ALERTS" -gt 0 ]; then
+    log_message "Deleted $DELETED_ALERTS old alerts"
+fi
+
+# Clean old bot health records (older than 14 days)
+DELETED_HEALTH=$(sqlite3 "$DB_PATH" "
+DELETE FROM bot_health 
+WHERE timestamp < datetime('now', '-14 days');
+SELECT changes();" 2>/dev/null | tail -1)
+
+if [ -n "$DELETED_HEALTH" ] && [ "$DELETED_HEALTH" -gt 0 ]; then
+    log_message "Deleted $DELETED_HEALTH old bot health records"
+fi
+
+# Clean old system metrics (older than 30 days)
+DELETED_METRICS=$(sqlite3 "$DB_PATH" "
+DELETE FROM system_metrics 
+WHERE timestamp < datetime('now', '-30 days');
+SELECT changes();" 2>/dev/null | tail -1)
+
+if [ -n "$DELETED_METRICS" ] && [ "$DELETED_METRICS" -gt 0 ]; then
+    log_message "Deleted $DELETED_METRICS old system metrics"
+fi
+
+# Clean old API usage records (older than 7 days)
+DELETED_API=$(sqlite3 "$DB_PATH" "
+DELETE FROM api_usage 
+WHERE timestamp < datetime('now', '-7 days');
+SELECT changes();" 2>/dev/null | tail -1)
+
+if [ -n "$DELETED_API" ] && [ "$DELETED_API" -gt 0 ]; then
+    log_message "Deleted $DELETED_API old API usage records"
+fi
+
+# Archive old trades (move trades older than 1 year to archive table)
+log_message "Archiving old trades..."
+sqlite3 "$DB_PATH" << 'SQL' 2>/dev/null
+CREATE TABLE IF NOT EXISTS trades_archive AS SELECT * FROM trades WHERE 1=0;
+INSERT OR IGNORE INTO trades_archive SELECT * FROM trades WHERE timestamp < datetime('now', '-1 year');
+DELETE FROM trades WHERE timestamp < datetime('now', '-1 year');
+SQL
+
+ARCHIVED_TRADES=$(sqlite3 "$DB_PATH" "SELECT changes();" 2>/dev/null)
+if [ -n "$ARCHIVED_TRADES" ] && [ "$ARCHIVED_TRADES" -gt 0 ]; then
+    log_message "Archived $ARCHIVED_TRADES old trades"
+fi
+
+# Integrity check
+log_message "Checking database integrity..."
+INTEGRITY=$(sqlite3 "$DB_PATH" "PRAGMA integrity_check;" 2>/dev/null)
+if [ "$INTEGRITY" = "ok" ]; then
+    log_message "Database integrity check passed"
+else
+    log_message "ERROR: Database integrity check failed: $INTEGRITY"
+    send_alert "critical" "Database integrity check failed after maintenance"
+    
+    # Restore from backup if integrity check fails
+    log_message "Restoring from backup due to integrity failure"
+    cp "$BACKUP_PATH" "$DB_PATH"
+    log_message "Database restored from backup"
+    send_alert "warning" "Database restored from backup due to integrity failure"
+fi
+
+# Get database size after maintenance
+DB_SIZE_AFTER=$(du -h "$DB_PATH" | cut -f1)
+log_message "Database size after: $DB_SIZE_AFTER"
+
+# Calculate space savings
+DB_SIZE_BEFORE_BYTES=$(du -b "$BACKUP_PATH" | cut -f1)
+DB_SIZE_AFTER_BYTES=$(du -b "$DB_PATH" | cut -f1)
+if [ "$DB_SIZE_BEFORE_BYTES" -gt "$DB_SIZE_AFTER_BYTES" ]; then
+    SPACE_SAVED=$((DB_SIZE_BEFORE_BYTES - DB_SIZE_AFTER_BYTES))
+    SPACE_SAVED_MB=$((SPACE_SAVED / 1024 / 1024))
+    log_message "Space saved: ${SPACE_SAVED_MB}MB"
+fi
+
+# Final statistics
+log_message "Database statistics after maintenance:"
+if command -v sqlite3 &> /dev/null; then
+    sqlite3 "$DB_PATH" << 'SQL' 2>/dev/null | while read line; do log_message "  $line"; done
+.headers off
+.mode line
+SELECT 'Trades: ' || COUNT(*) FROM trades;
+SELECT 'Alerts: ' || COUNT(*) FROM alerts;
+SELECT 'Bot Health Records: ' || COUNT(*) FROM bot_health;
+SELECT 'System Metrics: ' || COUNT(*) FROM system_metrics;
+SELECT 'API Usage Records: ' || COUNT(*) FROM api_usage;
+SELECT 'Archived Trades: ' || COUNT(*) FROM trades_archive WHERE EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='trades_archive');
+SQL
+fi
+
+# Clean old database backups (keep last 7 days)
+log_message "Cleaning old database backups..."
+find "$PHOENIX_DIR/backups" -name "db_backup_*.db" -mtime +7 -delete 2>/dev/null
+REMAINING_BACKUPS=$(find "$PHOENIX_DIR/backups" -name "db_backup_*.db" | wc -l)
+log_message "Remaining database backups: $REMAINING_BACKUPS"
+
+# Send completion alert
+send_alert "success" "Database maintenance completed successfully"
+
+log_message "Database maintenance completed successfully"
+EOF
+
+chmod +x "$PHOENIX_DIR/scripts/automation/database_maintenance.sh"
+
+# Create log cleanup script
+echo "📝 Creating log cleanup script..."
+cat > "$PHOENIX_DIR/scripts/automation/log_cleanup.sh" << 'EOF'
+#!/bin/bash
+
+# Phoenix Pro Elite - Log Cleanup Automation
+# Intelligent log rotation and cleanup
+
+PHOENIX_DIR="/root/phoenix-pro-elite"
+CLEANUP_LOG="$PHOENIX_DIR/logs/maintenance/log_cleanup.log"
+
+# Create cleanup log
+mkdir -p "$PHOENIX_DIR/logs/maintenance"
+
+# Function to log with timestamp
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$CLEANUP_LOG"
+}
+
+log_message "Starting log cleanup process"
+
+# Get log retention settings from config
+LOG_RETENTION_DAYS=30
+if [ -f "$PHOENIX_DIR/config.json" ] && command -v python3 &> /dev/null; then
+    LOG_RETENTION_DAYS=$(python3 -c "
+import json
+try:
+    with open('$PHOENIX_DIR/config.json') as f:
+        config = json.load(f)
+    print(config.get('log_retention_days', 30))
+except:
+    print(30)
+" 2>/dev/null)
+fi
+
+log_message "Log retention policy: $LOG_RETENTION_DAYS days"
+
+# Calculate sizes before cleanup
+LOGS_SIZE_BEFORE=$(du -sh "$PHOENIX_DIR/logs" 2>/dev/null | cut -f1)
+log_message "Log directory size before cleanup: $LOGS_SIZE_BEFORE"
+
+# Count files before cleanup
+TOTAL_FILES_BEFORE=$(find "$PHOENIX_DIR/logs" -type f | wc -l)
+log_message "Total log files before cleanup: $TOTAL_FILES_BEFORE"
+
+# Clean old log files by category
+CLEANED_FILES=0
+
+# System logs (keep recent ones longer)
+OLD_SYSTEM_LOGS=$(find "$PHOENIX_DIR/logs/system" -name "*.log" -mtime +$LOG_RETENTION_DAYS -type f)
+for log_file in $OLD_SYSTEM_LOGS; do
+    if [ -f "$log_file" ]; then
+        rm "$log_file"
+        ((CLEANED_FILES++))
+        log_message "Deleted old system log: $(basename "$log_file")"
+    fi
+done
+
+# Monitoring logs (shorter retention)
+MONITORING_RETENTION=$((LOG_RETENTION_DAYS / 2))
+OLD_MONITORING_LOGS=$(find "$PHOENIX_DIR/logs/monitoring" -name "*.log" -mtime +$MONITORING_RETENTION -type f)
+for log_file in $OLD_MONITORING_LOGS; do
+    if [ -f "$log_file" ]; then
+        rm "$log_file"
+        ((CLEANED_FILES++))
+        log_message "Deleted old monitoring log: $(basename "$log_file")"
+    fi
+done
+
+# Backup and maintenance logs (keep longer)
+MAINT_RETENTION=$((LOG_RETENTION_DAYS * 2))
+OLD_MAINT_LOGS=$(find "$PHOENIX_DIR/logs/backup" "$PHOENIX_DIR/logs/maintenance" -name "*.log" -mtime +$MAINT_RETENTION -type f 2>/dev/null)
+for log_file in $OLD_MAINT_LOGS; do
+    if [ -f "$log_file" ]; then
+        rm "$log_file"
+        ((CLEANED_FILES++))
+        log_message "Deleted old maintenance log: $(basename "$log_file")"
+    fi
+done
+
+# Performance data (compress old files instead of deleting)
+PERF_RETENTION=$((LOG_RETENTION_DAYS / 3))
+OLD_PERF_DATA=$(find "$PHOENIX_DIR/logs/monitoring" -name "*.csv" -mtime +$PERF_RETENTION -type f)
+for perf_file in $OLD_PERF_DATA; do
+    if [ -f "$perf_file" ]; then
+        # Compress instead of deleting
+        gzip "$perf_file" 2>/dev/null && log_message "Compressed performance data: $(basename "$perf_file")" || {
+            rm "$perf_file"
+            ((CLEANED_FILES++))
+            log_message "Deleted old performance file: $(basename "$perf_file")"
+        }
+    fi
+done
+
+# Clean very old compressed files
+OLD_COMPRESSED=$(find "$PHOENIX_DIR/logs" -name "*.gz" -mtime +$((LOG_RETENTION_DAYS * 3)) -type f)
+for compressed_file in $OLD_COMPRESSED; do
+    if [ -f "$compressed_file" ]; then
+        rm "$compressed_file"
+        ((CLEANED_FILES++))
+        log_message "Deleted old compressed file: $(basename "$compressed_file")"
+    fi
+done
+
+# Clean empty directories
+find "$PHOENIX_DIR/logs" -type d -empty -delete 2>/dev/null
+
+# Rotate large log files
+MAX_LOG_SIZE_MB=100
+find "$PHOENIX_DIR/logs" -name "*.log" -type f -size +${MAX_LOG_SIZE_MB}M | while read large_log; do
+    if [ -f "$large_log" ]; then
+        # Rotate large log file
+        mv "$large_log" "${large_log}.$(date +%Y%m%d_%H%M%S)"
+        touch "$large_log"
+        log_message "Rotated large log file: $(basename "$large_log")"
+    fi
+done
+
+# Clean Python cache files
+PYTHON_CACHE_CLEANED=0
+find "$PHOENIX_DIR" -name "__pycache__" -type d | while read cache_dir; do
+    if [ -d "$cache_dir" ]; then
+        rm -rf "$cache_dir"
+        ((PYTHON_CACHE_CLEANED++))
+    fi
+done
+
+if [ $PYTHON_CACHE_CLEANED -gt 0 ]; then
+    log_message "Cleaned $PYTHON_CACHE_CLEANED Python cache directories"
+fi
+
+# Clean temporary files
+TEMP_FILES_CLEANED=0
+find "$PHOENIX_DIR" -name "*.tmp" -o -name "*.temp" -type f | while read temp_file; do
+    if [ -f "$temp_file" ]; then
+        rm "$temp_file"
+        ((TEMP_FILES_CLEANED++))
+    fi
+done
+
+if [ $TEMP_FILES_CLEANED -gt 0 ]; then
+    log_message "Cleaned $TEMP_FILES_CLEANED temporary files"
+fi
+
+# Calculate sizes after cleanup
+LOGS_SIZE_AFTER=$(du -sh "$PHOENIX_DIR/logs" 2>/dev/null | cut -f1)
+TOTAL_FILES_AFTER=$(find "$PHOENIX_DIR/logs" -type f | wc -l)
+
+log_message "Log cleanup completed"
+log_message "Files cleaned: $CLEANED_FILES"
+log_message "Log directory size after: $LOGS_SIZE_AFTER"
+log_message "Total log files after: $TOTAL_FILES_AFTER"
+
+# Calculate space saved
+if [ "$LOGS_SIZE_BEFORE" != "$LOGS_SIZE_AFTER" ]; then
+    log_message "Log cleanup resulted in size change from $LOGS_SIZE_BEFORE to $LOGS_SIZE_AFTER"
+fi
+
+# Send cleanup notification
+if [ $CLEANED_FILES -gt 0 ]; then
+    if curl -s http://localhost:3000/api/ui/alerts > /dev/null 2>&1; then
+        curl -s -X POST http://localhost:3000/api/ui/alerts \
+             -H "Content-Type: application/json" \
+             -d "{\"level\":\"info\",\"message\":\"Log cleanup completed: $CLEANED_FILES files cleaned\",\"category\":\"maintenance\"}" > /dev/null 2>&1
+    fi
+fi
+EOF
+
+chmod +x "$PHOENIX_DIR/scripts/automation/log_cleanup.sh"
+
+# Create emergency recovery script
+echo "🚨 Creating emergency recovery script..."
+cat > "$PHOENIX_DIR/scripts/automation/emergency_recovery.sh" << 'EOF'
+#!/bin/bash
+
+# Phoenix Pro Elite - Emergency Recovery System
+# Comprehensive system recovery and failsafe procedures
+
+PHOENIX_DIR="/root/phoenix-pro-elite"
+RECOVERY_LOG="$PHOENIX_DIR/logs/maintenance/recovery_$(date +%Y%m%d_%H%M%S).log"
+
+# Create recovery log
+mkdir -p "$PHOENIX_DIR/logs/maintenance"
+
+# Function to log with timestamp
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$RECOVERY_LOG"
+}
+
+# Function to send recovery alert
+send_recovery_alert() {
+    local level="$1"
+    local message="$2"
+    
+    log_message "RECOVERY ALERT [$level]: $message"
+    
+    # Send to UI if available
+    if curl -s http://localhost:3000/api/ui/alerts > /dev/null 2>&1; then
+        curl -s -X POST http://localhost:3000/api/ui/alerts \
+             -H "Content-Type: application/json" \
+             -d "{\"level\":\"$level\",\"message\":\"$message\",\"category\":\"recovery\"}" > /dev/null 2>&1
+    fi
+}
+
+log_message "Starting emergency recovery procedures"
+send_recovery_alert "critical" "Emergency recovery initiated"
+
+# Check if recovery was triggered manually or automatically
+MANUAL_RECOVERY=false
+if [ "$1" = "--manual" ]; then
+    MANUAL_RECOVERY=true
+    log_message "Manual recovery mode activated"
+fi
+
+# Stop all Phoenix processes safely
+log_message "Stopping all Phoenix processes..."
+pkill -TERM -f "app.py" 2>/dev/null
+sleep 5
+pkill -KILL -f "app.py" 2>/dev/null
+
+if [ -f "/etc/systemd/system/phoenix-ui.service" ]; then
+    systemctl stop phoenix-ui 2>/dev/null
+    log_message "Stopped Phoenix systemd service"
+fi
+
+# Clear stuck network connections
+log_message "Clearing stuck network connections..."
+STUCK_CONNECTIONS=$(netstat -tulpn 2>/dev/null | grep -E ":3000|:8080" | wc -l)
+if [ "$STUCK_CONNECTIONS" -gt 0 ]; then
+    log_message "Found $STUCK_CONNECTIONS stuck connections"
+    
+    # Kill processes using critical ports
+    fuser -k 3000/tcp 2>/dev/null
+    fuser -k 8080/tcp 2>/dev/null
+    
+    sleep 3
+    
+    # Verify connections cleared
+    REMAINING_CONNECTIONS=$(netstat -tulpn 2>/dev/null | grep -E ":3000|:8080" | wc -l)
+    log_message "Remaining connections: $REMAINING_CONNECTIONS"
+fi
+
+# System resource recovery
+log_message "Checking system resources..."
+
+# Memory recovery
+MEM_USAGE=$(free | grep Mem | awk '{printf "%.0f", $3/$2 * 100.0}')
+if [ "$MEM_USAGE" -gt 90 ]; then
+    log_message "Critical memory usage: ${MEM_USAGE}%"
+    send_recovery_alert "warning" "Clearing memory caches due to high usage: ${MEM_USAGE}%"
+    
+    # Clear system caches
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || log_message "Could not clear system caches (need root)"
+    
+    # Kill memory-intensive processes if needed
+    if [ "$MEM_USAGE" -gt 95 ]; then
+        log_message "Killing memory-intensive processes"
+        # Kill processes using more than 500MB RAM (excluding critical system processes)
+        ps aux --sort=-%mem | awk 'NR>1 && $6>500000 && $11!~/^(kernel|kthreadd|migration|rcu_|watchdog|systemd)/ {system("kill -15 " $2)}'
+        sleep 5
+    fi
+    
+    # Check memory after cleanup
+    NEW_MEM_USAGE=$(free | grep Mem | awk '{printf "%.0f", $3/$2 * 100.0}')
+    log_message "Memory usage after cleanup: ${NEW_MEM_USAGE}%"
+fi
+
+# Disk space recovery
+DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+if [ "$DISK_USAGE" -gt 95 ]; then
+    log_message "Critical disk usage: ${DISK_USAGE}%"
+    send_recovery_alert "critical" "Emergency disk cleanup - usage at ${DISK_USAGE}%"
+    
+    # Emergency disk cleanup
+    log_message "Performing emergency disk cleanup..."
+    
+    # Clean logs aggressively
+    find "$PHOENIX_DIR/logs" -name "*.log" -mtime +1 -delete 2>/dev/null
+    find "$PHOENIX_DIR/logs" -name "*.log.*" -delete 2>/dev/null
+    
+    # Clean all Python cache
+    find "$PHOENIX_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+    find "$PHOENIX_DIR" -name "*.pyc" -delete 2>/dev/null
+    
+    # Clean system temp files
+    rm -rf /tmp/* 2>/dev/null
+    rm -rf /var/tmp/* 2>/dev/null
+    
+    # Clean package manager cache
+    apt-get clean 2>/dev/null || yum clean all 2>/dev/null || true
+    
+    # Clean old backups if space is critical
+    if [ "$DISK_USAGE" -gt 98 ]; then
+        find "$PHOENIX_DIR/backups" -name "*.tar.gz" -mtime +3 -delete 2>/dev/null
+        log_message "Emergency: Deleted recent backups to free space"
+        send_recovery_alert "warning" "Emergency backup deletion to free disk space"
+    fi
+    
+    # Check disk usage after cleanup
+    NEW_DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+    SPACE_FREED=$((DISK_USAGE - NEW_DISK_USAGE))
+    log_message "Disk cleanup completed. Usage reduced by ${SPACE_FREED}%"
+fi
+
+# Configuration file recovery
+log_message "Validating configuration files..."
+CONFIG_ERRORS=0
+
+# Check main config
+if [ -f "$PHOENIX_DIR/config.json" ]; then
+    if ! python3 -m json.tool "$PHOENIX_DIR/config.json" > /dev/null 2>&1; then
+        log_message "ERROR: Invalid config.json - attempting recovery"
+        
+        # Try to restore from backup
+        LATEST_BACKUP=$(find "$PHOENIX_DIR/backups" -name "phoenix_full_backup_*.tar.gz" -type f | sort | tail -1)
+        if [ -n "$LATEST_BACKUP" ]; then
+            tar -xzf "$LATEST_BACKUP" -C "$PHOENIX_DIR" config.json 2>/dev/null
+            if [ $? -eq 0 ]; then
+                log_message "Restored config.json from backup"
+                send_recovery_alert "success" "Configuration restored from backup"
+            else
+                log_message "Failed to restore config.json from backup"
+                ((CONFIG_ERRORS++))
+            fi
+        else
+            log_message "No backup available for config.json recovery"
+            ((CONFIG_ERRORS++))
+        fi
+    fi
+else
+    log_message "WARNING: config.json missing"
+    ((CONFIG_ERRORS++))
+fi
+
+# Validate other critical files
+CRITICAL_FILES=("data/strategies.json" "ui/app.py")
+for file in "${CRITICAL_FILES[@]}"; do
+    if [ ! -f "$PHOENIX_DIR/$file" ]; then
+        log_message "ERROR: Critical file missing: $file"
+        ((CONFIG_ERRORS++))
+        
+        # Try to restore from backup
+        LATEST_BACKUP=$(find "$PHOENIX_DIR/backups" -name "phoenix_full_backup_*.tar.gz" -type f | sort | tail -1)
+        if [ -n "$LATEST_BACKUP" ]; then
+            tar -xzf "$LATEST_BACKUP" -C "$PHOENIX_DIR" "$file" 2>/dev/null
+            if [ $? -eq 0 ]; then
+                log_message "Restored $file from backup"
+            else
+                log_message "Failed to restore $file from backup"
+            fi
+        fi
+    fi
+done
+
+# Database recovery
+log_message "Checking database integrity..."
+if [ -f "$PHOENIX_DIR/data/trades.db" ]; then
+    if command -v sqlite3 &> /dev/null; then
+        INTEGRITY=$(sqlite3 "$PHOENIX_DIR/data/trades.db" "PRAGMA integrity_check;" 2>/dev/null || echo "error")
+        if [ "$INTEGRITY" != "ok" ]; then
+            log_message "ERROR: Database corruption detected - attempting recovery"
+            send_recovery_alert "critical" "Database corruption detected - performing recovery"
+            
+            # Backup corrupted database
+            cp "$PHOENIX_DIR/data/trades.db" "$PHOENIX_DIR/data/trades_corrupted_$(date +%Y%m%d_%H%M%S).db"
+            
+            # Try to recover from backup
+            LATEST_DB_BACKUP=$(find "$PHOENIX_DIR/backups" -name "db_backup_*.db" -type f | sort | tail -1)
+            if [ -n "$LATEST_DB_BACKUP" ]; then
+                cp "$LATEST_DB_BACKUP" "$PHOENIX_DIR/data/trades.db"
+                log_message "Restored database from backup: $(basename "$LATEST_DB_BACKUP")"
+                send_recovery_alert "success" "Database restored from backup"
+            else
+                # Try SQLite recovery
+                log_message "No backup available - attempting SQLite recovery"
+                sqlite3 "$PHOENIX_DIR/data/trades.db" ".recover" | sqlite3 "$PHOENIX_DIR/data/trades_recovered.db" 2>/dev/null
+                
+                if [ -f "$PHOENIX_DIR/data/trades_recovered.db" ]; then
+                    mv "$PHOENIX_DIR/data/trades_recovered.db" "$PHOENIX_DIR/data/trades.db"
+                    log_message "Database recovered using SQLite recovery"
+                    send_recovery_alert "warning" "Database recovered with potential data loss"
+                else
+                    log_message "Database recovery failed - removing corrupted database"
+                    rm "$PHOENIX_DIR/data/trades.db"
+                    send_recovery_alert "error" "Database recovery failed - will recreate on startup"
+                fi
+            fi
+        else
+            log_message "Database integrity check passed"
+        fi
+    fi
+else
+    log_message "Database file missing - will be created on startup"
+fi
+
+# Reset file permissions
+log_message "Resetting file permissions..."
+chmod 755 "$PHOENIX_DIR"
+chmod 755 "$PHOENIX_DIR/ui"
+chmod -R 755 "$PHOENIX_DIR/logs"
+chmod -R 755 "$PHOENIX_DIR/scripts"
+chmod 700 "$PHOENIX_DIR/data"
+find "$PHOENIX_DIR" -name "*.sh" -exec chmod +x {} \;
+find "$PHOENIX_DIR/data" -name "*.json" -exec chmod 600 {} \; 2>/dev/null
+log_message "File permissions reset"
+
+# Check Python dependencies
+log_message "Checking Python dependencies..."
+MISSING_DEPS=0
+
+REQUIRED_MODULES=("flask" "flask_socketio" "psutil" "requests" "pandas" "numpy" "cryptography")
+for module in "${REQUIRED_MODULES[@]}"; do
+    python3 -c "import $module" 2>/dev/null || {
+        log_message "Missing Python module: $module"
+        ((MISSING_DEPS++))
+    }
+done
+
+if [ $MISSING_DEPS -gt 0 ]; then
+    log_message "Missing $MISSING_DEPS Python dependencies - they will auto-install on startup"
+    send_recovery_alert "warning" "Missing $MISSING_DEPS Python dependencies"
+fi
+
+# System health final check
+log_message "Final system health check..."
+HEALTH_ISSUES=0
+
+# Check critical ports
+if netstat -tulpn 2>/dev/null | grep -q ":3000.*LISTEN"; then
+    log_message "WARNING: Port 3000 still in use"
+    ((HEALTH_ISSUES++))
+fi
+
+# Check system load
+LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}' | cut -d',' -f1 | tr -d ' ')
+CPU_CORES=$(nproc)
+HIGH_LOAD_THRESHOLD=$(echo "$CPU_CORES * 3" | bc 2>/dev/null || echo "10")
+
+if (( $(echo "$LOAD_AVG > $HIGH_LOAD_THRESHOLD" | bc -l 2>/dev/null || echo "0") )); then
+    log_message "WARNING: High system load: $LOAD_AVG (cores: $CPU_CORES)"
+    ((HEALTH_ISSUES++))
+fi
+
+# Recovery summary
+log_message "Emergency recovery completed"
+log_message "Recovery Summary:"
+log_message "  - Configuration errors fixed: $CONFIG_ERRORS"
+log_message "  - Health issues detected: $HEALTH_ISSUES"
+log_message "  - Missing dependencies: $MISSING_DEPS"
+log_message "  - Memory usage: ${MEM_USAGE}%"
+log_message "  - Disk usage: ${DISK_USAGE}%"
+
+# Send final recovery status
+TOTAL_ISSUES=$((CONFIG_ERRORS + HEALTH_ISSUES))
+if [ "$TOTAL_ISSUES" -eq 0 ]; then
+    send_recovery_alert "success" "Emergency recovery completed successfully - system ready"
+    log_message "System recovery completed successfully"
+else
+    send_recovery_alert "warning" "Recovery completed with $TOTAL_ISSUES issues requiring attention"
+    log_message "System recovery completed with $TOTAL_ISSUES issues"
+fi
+
+# Restart Phoenix UI if recovery was successful and not manual
+if [ "$TOTAL_ISSUES" -eq 0 ] && [ "$MANUAL_RECOVERY" = false ] && [ -f "$PHOENIX_DIR/ui/app.py" ]; then
+    log_message "Attempting to restart Phoenix UI..."
+    cd "$PHOENIX_DIR"
+    
+    # Wait a moment before restart
+    sleep 5
+    
+    # Start in background
+    nohup ./start_phoenix.sh >> "$RECOVERY_LOG" 2>&1 &
+    
+    # Wait and check if it started
+    sleep 10
+    if pgrep -f "app.py" > /dev/null; then
+        log_message "Phoenix UI restarted successfully"
+        send_recovery_alert "success" "Phoenix UI restarted after recovery"
+    else
+        log_message "Failed to restart Phoenix UI"
+        send_recovery_alert "error" "Failed to restart Phoenix UI after recovery"
+    fi
+else
+    if [ "$MANUAL_RECOVERY" = true ]; then
+        log_message "Manual recovery mode - skipping automatic restart"
+    else
+        log_message "Skipping UI restart due to unresolved issues"
+    fi
+fi
+
+log_message "Emergency recovery procedures completed"
+
+# Create recovery report
+cat > "$PHOENIX_DIR/latest_recovery_report.txt" << REPORT_EOF
+Phoenix Pro Elite - Emergency Recovery Report
+============================================
+Date: $(date)
+Mode: $([ "$MANUAL_RECOVERY" = true ] && echo "Manual" || echo "Automatic")
+Status: $([ "$TOTAL_ISSUES" -eq 0 ] && echo "Success" || echo "Partial Success")
+
+Issues Found:
+- Configuration errors: $CONFIG_ERRORS
+- Health issues: $HEALTH_ISSUES  
+- Missing dependencies: $MISSING_DEPS
+
+System Status After Recovery:
+- Memory usage: ${MEM_USAGE}%
+- Disk usage: ${DISK_USAGE}%
+- Load average: $LOAD_AVG
+
+Recovery Log: $RECOVERY_LOG
+
+$([ "$TOTAL_ISSUES" -eq 0 ] && echo "✅ Recovery completed successfully" || echo "⚠️ Recovery completed with issues - manual review required")
+REPORT_EOF
+
+echo ""
+echo "🚨 Emergency Recovery Complete!"
+echo "================================"
+echo "📋 Recovery Report: $PHOENIX_DIR/latest_recovery_report.txt"
+echo "📝 Recovery Log: $RECOVERY_LOG"
+echo "🔧 Total Issues: $TOTAL_ISSUES"
+echo ""
+if [ "$TOTAL_ISSUES" -eq 0 ]; then
+    echo "✅ Recovery successful - system ready"
+else
+    echo "⚠️ Recovery completed with issues - review logs"
+fi
+EOF
+
+chmod +x "$PHOENIX_DIR/scripts/automation/emergency_recovery.sh"
+
+# Create automation startup script
+echo "🔄 Creating automation startup script..."
+cat > "$PHOENIX_DIR/start_automation.sh" << 'EOF'
+#!/bin/bash
+
+# Phoenix Pro Elite - Start All Automation Services
+# Comprehensive automation system activation
+
+PHOENIX_DIR="/root/phoenix-pro-elite"
+
+echo "🔄 Starting Phoenix Pro Elite Automation Services"
+echo "================================================="
+
+# Check if automation scripts exist
+AUTOMATION_SCRIPTS=(
+    "scripts/automation/automated_backup.sh"
+    "scripts/automation/database_maintenance.sh"
+    "scripts/automation/log_cleanup.sh"
+    "scripts/automation/emergency_recovery.sh"
+)
+
+echo "🔍 Checking automation scripts..."
+MISSING_SCRIPTS=0
+for script in "${AUTOMATION_SCRIPTS[@]}"; do
+    if [ -f "$PHOENIX_DIR/$script" ]; then
+        echo "✅ $script"
+    else
+        echo "❌ $script - Missing"
+        ((MISSING_SCRIPTS++))
+    fi
+done
+
+if [ $MISSING_SCRIPTS -gt 0 ]; then
+    echo "⚠️  $MISSING_SCRIPTS automation scripts missing"
+    echo "   Run setup_automation.sh first"
+    exit 1
+fi
+
+# Run automation services
+echo ""
+echo "🚀 Running automation services..."
+
+# Create backup
+echo "💾 Running automated backup..."
+"$PHOENIX_DIR/scripts/automation/automated_backup.sh"
+
+# Database maintenance
+echo "🗄️ Running database maintenance..."
+"$PHOENIX_DIR/scripts/automation/database_maintenance.sh"
+
+# Log cleanup
+echo "📝 Running log cleanup..."
+"$PHOENIX_DIR/scripts/automation/log_cleanup.sh"
+
+echo ""
+echo "✅ Automation services completed!"
+echo ""
+echo "📋 Automation Tasks Executed:"
+echo "   💾 Automated backup with rotation"
+echo "   🗄️ Database maintenance and optimization"
+echo "   📝 Log cleanup and rotation"
+echo ""
+echo "📝 Automation logs:"
+echo "   Backup: tail -f $PHOENIX_DIR/logs/backup/backup.log"
+echo "   Maintenance: tail -f $PHOENIX_DIR/logs/maintenance/database_maintenance.log"
+echo "   Log Cleanup: tail -f $PHOENIX_DIR/logs/maintenance/log_cleanup.log"
+echo ""
+echo "🚨 Emergency Recovery: $PHOENIX_DIR/scripts/automation/emergency_recovery.sh"
+echo ""
+echo "🎯 All automation tasks completed successfully!"
+EOF
+
+chmod +x "$PHOENIX_DIR/start_automation.sh"
+
+# Set up automated scheduling with cron (if running as root)
+if [ "$SETUP_SYSTEM" = true ]; then
+    echo "⏰ Setting up automated scheduling with cron jobs..."
+    
+    # Add automation cron jobs (append to existing monitoring crons)
+    (crontab -l 2>/dev/null; cat << AUTOMATION_CRON_EOF
+
+# Phoenix Pro Elite - Automation Schedule
+# Daily backup at 2 AM
+0 2 * * * $PHOENIX_DIR/scripts/automation/automated_backup.sh
+
+# Database maintenance every Sunday at 3 AM
+0 3 * * 0 $PHOENIX_DIR/scripts/automation/database_maintenance.sh
+
+# Log cleanup every day at 1 AM
+0 1 * * * $PHOENIX_DIR/scripts/automation/log_cleanup.sh
+
+# Weekly comprehensive automation (Sundays at 4 AM)
+0 4 * * 0 $PHOENIX_DIR/start_automation.sh
+AUTOMATION_CRON_EOF
+    ) | crontab -
+    
+    echo "✅ Automated scheduling configured:"
+    echo "   💾 Daily backups: 2 AM"
+    echo "   🗄️ Database maintenance: Weekly (Sunday 3 AM)"
+    echo "   📝 Log cleanup: Daily (1 AM)"
+    echo "   🔄 Full automation: Weekly (Sunday 4 AM)"
+else
+    echo "⚠️  Running as non-root - cron jobs not configured"
+    echo "   Run 'crontab -e' manually to add automation schedule"
+fi
+
+# Create system health check script
+echo "🩺 Creating system health check script..."
+cat > "$PHOENIX_DIR/scripts/automation/health_check.sh" << 'EOF'
+#!/bin/bash
+
+# Phoenix Pro Elite - Comprehensive Health Check
+# Complete system health validation
+
+PHOENIX_DIR="/root/phoenix-pro-elite"
+HEALTH_LOG="$PHOENIX_DIR/logs/maintenance/health_check.log"
+
+# Create health log
+mkdir -p "$PHOENIX_DIR/logs/maintenance"
+
+# Function to log with timestamp
+log_message() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$HEALTH_LOG"
+}
+
+log_message "Starting comprehensive health check"
+
+# Health scoring
+HEALTH_SCORE=100
+ISSUES_FOUND=0
+
+# Check system resources
+CPU_USAGE=$(top -bn1 | grep "Cpu(s)" | awk '{print $2}' | cut -d'%' -f1 | cut -d',' -f1)
+MEM_USAGE=$(free | grep Mem | awk '{printf "%.0f", $3/$2 * 100.0}')
+DISK_USAGE=$(df -h / | awk 'NR==2 {print $5}' | sed 's/%//')
+
+log_message "System Resources:"
+log_message "  CPU: ${CPU_USAGE}%"
+log_message "  Memory: ${MEM_USAGE}%"
+log_message "  Disk: ${DISK_USAGE}%"
+
+# Deduct points for high resource usage
+if [ "${CPU_USAGE%.*}" -gt 80 ]; then
+    HEALTH_SCORE=$((HEALTH_SCORE - 10))
+    ((ISSUES_FOUND++))
+    log_message "Issue: High CPU usage (${CPU_USAGE}%)"
+fi
+
+if [ "$MEM_USAGE" -gt 85 ]; then
+    HEALTH_SCORE=$((HEALTH_SCORE - 15))
+    ((ISSUES_FOUND++))
+    log_message "Issue: High memory usage (${MEM_USAGE}%)"
+fi
+
+if [ "$DISK_USAGE" -gt 90 ]; then
+    HEALTH_SCORE=$((HEALTH_SCORE - 20))
+    ((ISSUES_FOUND++))
+    log_message "Issue: High disk usage (${DISK_USAGE}%)"
+fi
+
+# Check processes
+if ! pgrep -f "app.py" > /dev/null; then
+    HEALTH_SCORE=$((HEALTH_SCORE - 25))
+    ((ISSUES_FOUND++))
+    log_message "Issue: Phoenix UI not running"
+else
+    log_message "✅ Phoenix UI process running"
+fi
+
+# Check services
+if curl -s http://localhost:3000 > /dev/null 2>&1; then
+    log_message "✅ Phoenix UI accessible"
+else
+    HEALTH_SCORE=$((HEALTH_SCORE - 20))
+    ((ISSUES_FOUND++))
+    log_message "Issue: Phoenix UI not accessible"
+fi
+
+if curl -s http://localhost:8080/api/status > /dev/null 2>&1; then
+    log_message "✅ Backend API accessible"
+else
+    HEALTH_SCORE=$((HEALTH_SCORE - 15))
+    ((ISSUES_FOUND++))
+    log_message "Issue: Backend not accessible"
+fi
+
+# Check database
+if [ -f "$PHOENIX_DIR/data/trades.db" ]; then
+    if command -v sqlite3 &> /dev/null; then
+        INTEGRITY=$(sqlite3 "$PHOENIX_DIR/data/trades.db" "PRAGMA integrity_check;" 2>/dev/null || echo "error")
+        if [ "$INTEGRITY" = "ok" ]; then
+            log_message "✅ Database integrity check passed"
+        else
+            HEALTH_SCORE=$((HEALTH_SCORE - 30))
+            ((ISSUES_FOUND++))
+            log_message "Issue: Database integrity check failed"
+        fi
+    fi
+    
+    DB_SIZE=$(du -h "$PHOENIX_DIR/data/trades.db" | cut -f1)
+    log_message "Database size: $DB_SIZE"
+else
+    HEALTH_SCORE=$((HEALTH_SCORE - 10))
+    ((ISSUES_FOUND++))
+    log_message "Issue: Database file not found"
+fi
+
+# Check configuration files
+CRITICAL_FILES=("config.json" "data/strategies.json" "ui/app.py")
+for file in "${CRITICAL_FILES[@]}"; do
+    if [ -f "$PHOENIX_DIR/$file" ]; then
+        log_message "✅ $file exists"
+    else
+        HEALTH_SCORE=$((HEALTH_SCORE - 10))
+        ((ISSUES_FOUND++))
+        log_message "Issue: $file missing"
+    fi
+done
+
+# Check recent backups
+RECENT_BACKUP=$(find "$PHOENIX_DIR/backups" -name "phoenix_full_backup_*.tar.gz" -mtime -7 | head -1)
+if [ -n "$RECENT_BACKUP" ]; then
+    BACKUP_AGE=$(find "$PHOENIX_DIR/backups" -name "phoenix_full_backup_*.tar.gz" -mtime -1 | wc -l)
+    if [ "$BACKUP_AGE" -gt 0 ]; then
+        log_message "✅ Recent backup available (within 24 hours)"
+    else
+        log_message "⚠️ Backup older than 24 hours"
+        HEALTH_SCORE=$((HEALTH_SCORE - 5))
+    fi
+else
+    HEALTH_SCORE=$((HEALTH_SCORE - 15))
+    ((ISSUES_FOUND++))
+    log_message "Issue: No recent backups found"
+fi
+
+# Check network connectivity
+if ping -c 1 8.8.8.8 > /dev/null 2>&1; then
+    log_message "✅ Internet connectivity"
+else
+    HEALTH_SCORE=$((HEALTH_SCORE - 10))
+    ((ISSUES_FOUND++))
+    log_message "Issue: No internet connectivity"
+fi
+
+# Final health assessment
+log_message "Health Check Summary:"
+log_message "  Health Score: $HEALTH_SCORE/100"
+log_message "  Issues Found: $ISSUES_FOUND"
+
+if [ "$HEALTH_SCORE" -ge 90 ]; then
+    log_message "System Health: EXCELLENT"
+    STATUS_ICON="🟢"
+    STATUS_COLOR="GREEN"
+elif [ "$HEALTH_SCORE" -ge 70 ]; then
+    log_message "System Health: GOOD"
+    STATUS_ICON="🟡"
+    STATUS_COLOR="YELLOW"
+elif [ "$HEALTH_SCORE" -ge 50 ]; then
+    log_message "System Health: FAIR"
+    STATUS_ICON="🟠"
+    STATUS_COLOR="ORANGE"
+else
+    log_message "System Health: POOR"
+    STATUS_ICON="🔴"
+    STATUS_COLOR="RED"
+fi
+
+# Send health status to UI
+if curl -s http://localhost:3000/api/ui/alerts > /dev/null 2>&1; then
+    ALERT_LEVEL="info"
+    if [ "$HEALTH_SCORE" -lt 70 ]; then
+        ALERT_LEVEL="warning"
+    fi
+    if [ "$HEALTH_SCORE" -lt 50 ]; then
+        ALERT_LEVEL="error"
+    fi
+    
+    curl -s -X POST http://localhost:3000/api/ui/alerts \
+         -H "Content-Type: application/json" \
+         -d "{\"level\":\"$ALERT_LEVEL\",\"message\":\"Health Check: $HEALTH_SCORE/100 - $ISSUES_FOUND issues found\",\"category\":\"health\"}" > /dev/null 2>&1
+fi
+
+# Create health report
+cat > "$PHOENIX_DIR/latest_health_report.txt" << HEALTH_REPORT_EOF
+Phoenix Pro Elite - System Health Report
+========================================
+Date: $(date)
+Health Score: $HEALTH_SCORE/100
+Status: $STATUS_COLOR ($STATUS_ICON)
+
+System Resources:
+- CPU Usage: ${CPU_USAGE}%
+- Memory Usage: ${MEM_USAGE}%
+- Disk Usage: ${DISK_USAGE}%
+
+Services Status:
+- Phoenix UI: $(pgrep -f "app.py" > /dev/null && echo "Running" || echo "Not Running")
+- UI Accessible: $(curl -s http://localhost:3000 > /dev/null 2>&1 && echo "Yes" || echo "No")
+- Backend Accessible: $(curl -s http://localhost:8080 > /dev/null 2>&1 && echo "Yes" || echo "No")
+
+Database:
+- File Exists: $([ -f "$PHOENIX_DIR/data/trades.db" ] && echo "Yes" || echo "No")
+- Size: $([ -f "$PHOENIX_DIR/data/trades.db" ] && du -h "$PHOENIX_DIR/data/trades.db" | cut -f1 || echo "N/A")
+- Integrity: $([ -f "$PHOENIX_DIR/data/trades.db" ] && sqlite3 "$PHOENIX_DIR/data/trades.db" "PRAGMA integrity_check;" 2>/dev/null || echo "N/A")
+
+Recent Backup: $([ -n "$RECENT_BACKUP" ] && echo "Available" || echo "None Found")
+
+Issues Found: $ISSUES_FOUND
+Recommendations: $([ "$ISSUES_FOUND" -eq 0 ] && echo "System is healthy" || echo "Review health check log for details")
+
+Health Log: $HEALTH_LOG
+HEALTH_REPORT_EOF
+
+log_message "Health check completed - report saved to latest_health_report.txt"
+
+# Exit with error code if health is poor
+if [ "$HEALTH_SCORE" -lt 50 ]; then
+    exit 1
+fi
+EOF
+
+chmod +x "$PHOENIX_DIR/scripts/automation/health_check.sh"
+
+# Run initial automation
+echo "🔍 Running initial automation setup..."
+"$PHOENIX_DIR/start_automation.sh"
+
+# Final summary
+echo ""
+echo "✅ PHASE 3B INSTALLATION COMPLETE!"
+echo "=================================="
+echo ""
+echo "🔄 AUTOMATION SCRIPTS CREATED:"
+echo "   💾 Automated Backup: scripts/automation/automated_backup.sh"
+echo "   🗄️ Database Maintenance: scripts/automation/database_maintenance.sh"
+echo "   📝 Log Cleanup: scripts/automation/log_cleanup.sh"
+echo "   🚨 Emergency Recovery: scripts/automation/emergency_recovery.sh"
+echo "   🩺 Health Check: scripts/automation/health_check.sh"
+echo ""
+echo "🚀 STARTUP SCRIPTS:"
+echo "   🔄 Start All Automation: $PHOENIX_DIR/start_automation.sh"
+echo ""
+if [ "$SETUP_SYSTEM" = true ]; then
+echo "⏰ AUTOMATION SCHEDULE (CRON):"
+echo "   💾 Daily backups: 2 AM"
+echo "   🗄️ Database maintenance: Weekly (Sunday 3 AM)"
+echo "   📝 Log cleanup: Daily (1 AM)"
+echo "   🔄 Full automation: Weekly (Sunday 4 AM)"
+echo ""
+fi
+echo "🔧 USAGE COMMANDS:"
+echo "   Run Automation: $PHOENIX_DIR/start_automation.sh"
+echo "   Manual Backup: $PHOENIX_DIR/scripts/automation/automated_backup.sh"
+echo "   Emergency Recovery: $PHOENIX_DIR/scripts/automation/emergency_recovery.sh --manual"
+echo "   Health Check: $PHOENIX_DIR/scripts/automation/health_check.sh"
+echo "   View Logs: tail -f $PHOENIX_DIR/logs/backup/*.log"
+echo ""
+echo "📊 AUTOMATION FEATURES:"
+echo "   💾 Automated backup with rotation and verification"
+echo "   🗄️ Database optimization and cleanup"
+echo "   📝 Intelligent log management and rotation"
+echo "   🚨 Emergency recovery with system restoration"
+echo "   🩺 Comprehensive health monitoring"
+echo "   📋 Detailed reporting and logging"
+echo "   ⏰ Automated scheduling via cron"
+echo ""
+echo "✅ PHOENIX AUTOMATION SYSTEM READY!"
+echo "🚨 Complete automation, backups, and recovery - ALL CONFIGURED!"
